@@ -213,6 +213,12 @@ jobs:
     - name: Validate manual confirmation
       if: github.event_name == 'workflow_dispatch'
       run: |
+        echo "Debug info:"
+        echo "Action: '${{ github.event.inputs.action }}'"
+        echo "Confirm apply: '${{ github.event.inputs.confirm_apply }}'"
+        echo "Event name: '${{ github.event_name }}'"
+        echo ""
+        
         if [ "${{ github.event.inputs.action }}" = "apply" ] && [ "${{ github.event.inputs.confirm_apply }}" != "yes" ]; then
           echo "❌ Apply action requires confirmation. Please set 'confirm_apply' to 'yes'"
           echo "This safety check prevents accidental infrastructure changes."
@@ -306,10 +312,18 @@ jobs:
     steps:
     - name: Validate destroy confirmation
       run: |
+        echo "Debug info:"
+        echo "Action: '${{ github.event.inputs.action }}'"
+        echo "Confirm apply: '${{ github.event.inputs.confirm_apply }}'"
+        echo "Event name: '${{ github.event_name }}'"
+        echo ""
+        
         if [ "${{ github.event.inputs.confirm_apply }}" != "yes" ]; then
           echo "❌ Destroy action requires confirmation. Please set 'confirm_apply' to 'yes'"
           echo "⚠️  This will permanently delete your EKS cluster and all associated resources!"
           echo "💡 To confirm, run the workflow again with confirm_apply set to 'yes'"
+          echo ""
+          echo "Current confirm_apply value: '${{ github.event.inputs.confirm_apply }}'"
           exit 1
         fi
         echo "✅ Destroy confirmation validated"
