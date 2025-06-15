@@ -48,22 +48,33 @@ jobs:
     - name: Generate unique bucket name
       id: generate-name
       run: |
+        # Generate truly unique bucket name
         TIMESTAMP=$(date +%s)
-        RANDOM_SUFFIX=$(openssl rand -hex 4)
-        BUCKET_NAME="eks-tofu-state-${GITHUB_REPOSITORY_OWNER,,}-${TIMESTAMP}-${RANDOM_SUFFIX}"
-        # Remove any invalid characters for S3 bucket names
-        BUCKET_NAME=$(echo $BUCKET_NAME | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+        RANDOM_SUFFIX=$(openssl rand -hex 6)
+        REPO_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')
+        OWNER_NAME=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+        
+        # Create bucket name following S3 naming conventions
+        BUCKET_NAME="tofu-state-${OWNER_NAME}-${REPO_NAME}-${TIMESTAMP}-${RANDOM_SUFFIX}"
+        # Ensure it's valid (lowercase, no underscores, etc.)
+        BUCKET_NAME=$(echo $BUCKET_NAME | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g')
+        
         echo "bucket-name=${BUCKET_NAME}" >> $GITHUB_OUTPUT
         echo "dynamodb-table=${BUCKET_NAME}-lock" >> $GITHUB_OUTPUT
+        echo "Generated bucket name: ${BUCKET_NAME}"
 
     - name: Check if S3 bucket exists
       id: check-bucket
       run: |
         BUCKET_NAME="${{ steps.generate-name.outputs.bucket-name }}"
+        
+        # Check if bucket exists and is accessible
         if aws s3api head-bucket --bucket $BUCKET_NAME 2>/dev/null; then
           echo "exists=true" >> $GITHUB_OUTPUT
+          echo "Bucket $BUCKET_NAME already exists"
         else
           echo "exists=false" >> $GITHUB_OUTPUT
+          echo "Bucket $BUCKET_NAME does not exist, will create"
         fi
 
     - name: Create S3 bucket for Terraform state
@@ -72,11 +83,30 @@ jobs:
       run: |
         BUCKET_NAME="${{ steps.generate-name.outputs.bucket-name }}"
         
-        # Create bucket
-        aws s3api create-bucket \
-          --bucket $BUCKET_NAME \
-          --region ${{ env.AWS_REGION }} \
-          --create-bucket-configuration LocationConstraint=${{ env.AWS_REGION }}
+        # Create bucket with region-specific logic
+        if [ "${{ env.AWS_REGION }}" = "us-east-1" ]; then
+          # us-east-1 doesn't require LocationConstraint
+          aws s3api create-bucket \
+            --bucket $BUCKET_NAME \
+            --region ${{ env.AWS_REGION }}
+        else
+          # All other regions require LocationConstraint
+          aws s3api create-bucket \
+            --bucket $BUCKET_NAME \
+            --region ${{ env.AWS_REGION }} \
+            --create-bucket-configuration LocationConstraint=${{ env.AWS_REGION }}
+        fi
+        
+        # Wait a moment for bucket to be fully created
+        sleep 5
+        
+        # Verify bucket was created
+        if aws s3api head-bucket --bucket $BUCKET_NAME 2>/dev/null; then
+          echo "✅ Successfully created S3 bucket: $BUCKET_NAME"
+        else
+          echo "❌ Failed to verify bucket creation"
+          exit 1
+        fi
         
         # Enable versioning
         aws s3api put-bucket-versioning \
@@ -102,9 +132,8 @@ jobs:
           }'
         
         echo "bucket-name=${BUCKET_NAME}" >> $GITHUB_OUTPUT
-        echo "✅ Created S3 bucket: $BUCKET_NAME"
 
-    - name: Use existing bucket
+    - name: Use existing bucket or set output
       if: steps.check-bucket.outputs.exists == 'true'
       run: |
         BUCKET_NAME="${{ steps.generate-name.outputs.bucket-name }}"
