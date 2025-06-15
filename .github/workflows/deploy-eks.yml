@@ -250,9 +250,124 @@ jobs:
     if: |
       github.event_name == 'pull_request' || 
       (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan') ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'))
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup OpenTofu
+      uses: opentofu/setup-opentofu@v1
+      with:
+        tofu_version: ${{ env.TOFU_VERSION }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Create backend configuration
+      run: |
+        cat > terraform/backend.tf << EOF
+        terraform {
+          backend "s3" {
+            bucket         = "${{ needs.setup-state-backend.outputs.bucket-name }}"
+            key            = "eks-cluster/terraform.tfstate"
+            region         = "${{ env.AWS_REGION }}"
+            dynamodb_table = "${{ needs.setup-state-backend.outputs.dynamodb-table }}"
+            encrypt        = true
+          }
+        }
+        EOF
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: tofu init
+
+    - name: Terraform Validate
+      working-directory: ./terraform
+      run: tofu validate
+
+    - name: Terraform Plan
+      id: plan
+      working-directory: ./terraform
+      run: |
+        tofu plan \
+          -var="cluster_name=${{ env.CLUSTER_NAME }}" \
+          -var="region=${{ env.AWS_REGION }}" \
+          -out=tfplan \
+          -detailed-exitcode
+      continue-on-error: true
+
+    - name: Upload plan artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan-${{ github.run_number }}
+        path: terraform/tfplan
+        retention-days: 5
+        compression-level: 6
+
+    - name: Create Plan Summary
+      if: always()
+      run: |
+        echo "## 📋 Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.plan.outputs.exitcode }}" = "0" ]; then
+          echo "✅ **No changes detected** - Infrastructure is up to date" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎯 No apply needed." >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.plan.outputs.exitcode }}" = "2" ]; then
+          echo "📝 **Changes detected** - Infrastructure will be modified" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🚀 Ready to apply changes!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "- Review the plan above carefully" >> $GITHUB_STEP_SUMMARY
+          echo "- If this is a push to main/develop, the **Apply** job will wait for your approval" >> $GITHUB_STEP_SUMMARY
+          echo "- Go to the **Apply** job and click **Review deployments** → **Approve and deploy**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Plan failed** - Please check the logs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔍 Check the plan output above for errors." >> $GITHUB_STEP_SUMMARY
+        fi
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [workflow-info, setup-state-backend, plan]
+    if: |
+      needs.plan.outputs.plan-exitcode == '2' && (
+        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.ref == 'refs/heads/develop' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+      )
+    environment: 
+      name: production
+      url: ${{ steps.cluster-info.outputs.cluster-endpoint }}
     
     steps:
+    - name: Manual Approval Required
+      run: |
+        echo "🎯 **Manual Approval Required**"
+        echo ""
+        echo "📋 **Plan Summary:**"
+        echo "- Plan detected changes (exit code: ${{ needs.plan.outputs.plan-exitcode }})"
+        echo "- Infrastructure will be modified"
+        echo ""
+        echo "⏳ **Waiting for approval...**"
+        echo "Someone with approval rights needs to:"
+        echo "1. Review the plan output above"
+        echo "2. Click 'Review deployments' button"
+        echo "3. Select 'production' environment" 
+        echo "4. Click 'Approve and deploy'"
+        echo ""
+        echo "🛡️ This ensures no infrastructure changes happen without human review."
+
     - name: Validate manual confirmation
       if: github.event_name == 'workflow_dispatch'
       run: |
@@ -292,10 +407,10 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
-    - name: Download plan artifact (optional)
+    - name: Download plan artifact
       uses: actions/download-artifact@v4
       with:
-        name: terraform-plan
+        name: terraform-plan-${{ github.run_number }}
         path: terraform/
       continue-on-error: true
 
@@ -329,106 +444,20 @@ jobs:
       working-directory: ./terraform
       run: tofu init
 
-    - name: Terraform Validate
-      working-directory: ./terraform
-      run: tofu validate
-
-    - name: Terraform Plan
-      working-directory: ./terraform
-      run: |
-        tofu plan \
-          -var="cluster_name=${{ env.CLUSTER_NAME }}" \
-          -var="region=${{ env.AWS_REGION }}" \
-          -out=tfplan
-
-    - name: Upload plan artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: terraform-plan
-        path: terraform/tfplan
-        retention-days: 5
-        compression-level: 6
-
-  apply:
-    name: Terraform Apply
-    runs-on: ubuntu-latest
-    needs: [workflow-info, setup-state-backend, plan]
-    if: |
-      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
-    environment: 
-      name: production
-      url: ${{ steps.cluster-info.outputs.cluster-endpoint }}
-    
-  destroy:
-    name: Terraform Destroy
-    runs-on: ubuntu-latest
-    needs: [workflow-info, setup-state-backend]
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
-    environment: 
-      name: production-destroy
-      url: "Destroying EKS cluster and all resources"
-    
-    steps:
-    - name: Validate destroy confirmation
-      run: |
-        echo "Debug info:"
-        echo "Action: '${{ github.event.inputs.action }}'"
-        echo "Confirm apply: '${{ github.event.inputs.confirm_apply }}'"
-        echo "Event name: '${{ github.event_name }}'"
-        echo ""
-        
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.confirm_apply }}" != "yes" ]; then
-          echo "❌ Destroy action requires confirmation. Please set 'confirm_apply' to 'yes'"
-          echo "⚠️  This will permanently delete your EKS cluster and all associated resources!"
-          echo "💡 To confirm, run the workflow again with confirm_apply set to 'yes'"
-          echo ""
-          echo "Current confirm_apply value: '${{ github.event.inputs.confirm_apply }}'"
-          exit 1
-        fi
-        echo "✅ Destroy confirmation validated"
-        echo "⚠️  Proceeding with cluster destruction..."
-
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup OpenTofu
-      uses: opentofu/setup-opentofu@v1
-      with:
-        tofu_version: ${{ env.TOFU_VERSION }}
-
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
-
-    - name: Create backend configuration
-      run: |
-        cat > terraform/backend.tf << EOF
-        terraform {
-          backend "s3" {
-            bucket         = "${{ needs.setup-state-backend.outputs.bucket-name }}"
-            key            = "eks-cluster/terraform.tfstate"
-            region         = "${{ env.AWS_REGION }}"
-            dynamodb_table = "${{ needs.setup-state-backend.outputs.dynamodb-table }}"
-            encrypt        = true
-          }
-        }
-        EOF
-
-    - name: Terraform Init
-      working-directory: ./terraform
-      run: tofu init
-
     - name: Terraform Apply
       working-directory: ./terraform
       run: |
-        tofu apply \
-          -var="cluster_name=${{ steps.set-cluster-name.outputs.cluster-name }}" \
-          -var="region=${{ env.AWS_REGION }}" \
-          -auto-approve
+        # Try to use saved plan first, fallback to new plan if needed
+        if [ -f "tfplan" ]; then
+          echo "📦 Using saved plan from previous step"
+          tofu apply tfplan
+        else
+          echo "📝 Creating fresh plan (saved plan not found)"
+          tofu apply \
+            -var="cluster_name=${{ steps.set-cluster-name.outputs.cluster-name }}" \
+            -var="region=${{ env.AWS_REGION }}" \
+            -auto-approve
+        fi
 
     - name: Get cluster info
       id: cluster-info
@@ -452,6 +481,8 @@ jobs:
       run: |
         echo "## 🚀 EKS Cluster Deployment Summary" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ **Successfully deployed!**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
         echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
         echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
         echo "| Cluster Name | ${{ steps.cluster-info.outputs.cluster-name }} |" >> $GITHUB_STEP_SUMMARY
@@ -467,13 +498,32 @@ jobs:
   destroy:
     name: Terraform Destroy
     runs-on: ubuntu-latest
-    needs: setup-state-backend
+    needs: [workflow-info, setup-state-backend]
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
     environment: 
       name: production-destroy
       url: "Destroying EKS cluster and all resources"
     
     steps:
+    - name: Validate destroy confirmation
+      run: |
+        echo "Debug info:"
+        echo "Action: '${{ github.event.inputs.action }}'"
+        echo "Confirm apply: '${{ github.event.inputs.confirm_apply }}'"
+        echo "Event name: '${{ github.event_name }}'"
+        echo ""
+        
+        if [ "${{ github.event.inputs.confirm_apply }}" != "yes" ]; then
+          echo "❌ Destroy action requires confirmation. Please set 'confirm_apply' to 'yes'"
+          echo "⚠️  This will permanently delete your EKS cluster and all associated resources!"
+          echo "💡 To confirm, run the workflow again with confirm_apply set to 'yes'"
+          echo ""
+          echo "Current confirm_apply value: '${{ github.event.inputs.confirm_apply }}'"
+          exit 1
+        fi
+        echo "✅ Destroy confirmation validated"
+        echo "⚠️  Proceeding with cluster destruction..."
+
     - name: Checkout code
       uses: actions/checkout@v4
 
