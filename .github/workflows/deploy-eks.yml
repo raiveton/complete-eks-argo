@@ -578,3 +578,5 @@ jobs:
         aws dynamodb delete-table --table-name ${{ needs.setup-state-backend.outputs.dynamodb-table }}
         
         echo "🗑️ State backend resources cleaned up"
+
+        
