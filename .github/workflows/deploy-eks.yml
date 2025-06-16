@@ -524,8 +524,18 @@ jobs:
       run: |
         CLUSTER_ENDPOINT=$(tofu output -raw cluster_endpoint)
         CLUSTER_NAME=$(tofu output -raw cluster_id)
+        
         echo "cluster-endpoint=${CLUSTER_ENDPOINT}" >> $GITHUB_OUTPUT
         echo "cluster-name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+        
+        # Wait a bit for ArgoCD to be ready
+        echo "⏳ Waiting for ArgoCD LoadBalancer to be ready..."
+        sleep 60
+        
+        # Get ArgoCD info
+        ARGOCD_URL=$(tofu output -raw argocd_server_url 2>/dev/null || echo "pending")        
+        echo "argocd-url=${ARGOCD_URL}" >> $GITHUB_OUTPUT
+        echo "argocd-password=${ARGOCD_PASSWORD}" >> $GITHUB_OUTPUT
 
     - name: Configure kubectl
       run: |

@@ -355,6 +355,75 @@ resource "aws_eks_addon" "ebs_csi_driver" {
   addon_name   = "aws-ebs-csi-driver"
 }
 
+# ArgoCD Namespace
+resource "kubernetes_namespace" "argocd" {
+  metadata {
+    name = "argocd"
+  }
+  
+  depends_on = [aws_eks_node_group.eks_nodes]
+}
+
+# ArgoCD Helm Release
+resource "helm_release" "argocd" {
+  name       = "argocd"
+  repository = "https://argoproj.github.io/argo-helm"
+  chart      = "argo-cd"
+  version    = "5.51.6"  # Latest stable version
+  namespace  = kubernetes_namespace.argocd.metadata[0].name
+
+  # ArgoCD Server Configuration
+  values = [
+    <<EOF
+global:
+  domain: argocd.${aws_eks_cluster.eks_cluster.name}.local
+
+server:
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+  
+  # Enable insecure mode for easier access (you can enable TLS later)
+  extraArgs:
+    - --insecure
+
+configs:
+  params:
+    server.insecure: true
+
+
+# Enable notifications controller
+notifications:
+  enabled: true
+
+# Enable applicationSet controller  
+applicationSet:
+  enabled: true
+
+# Enable dex for SSO (optional)
+dex:
+  enabled: false
+EOF
+  ]
+
+  depends_on = [
+    aws_eks_node_group.eks_nodes,
+    kubernetes_namespace.argocd
+  ]
+}
+
+# Data source to get ArgoCD LoadBalancer hostname
+data "kubernetes_service" "argocd_server" {
+  metadata {
+    name      = "argocd-server"
+    namespace = kubernetes_namespace.argocd.metadata[0].name
+  }
+  
+  depends_on = [helm_release.argocd]
+}
+
 # outputs.tf
 output "cluster_id" {
   description = "EKS cluster ID"
