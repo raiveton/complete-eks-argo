@@ -35,7 +35,7 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  CLUSTER_NAME: my-eks-cluster
+  CLUSTER_NAME: raiveton-test
   TF_VERSION: 1.6.6
   TOFU_VERSION: 1.6.0
   # Optional: override bucket name (leave empty for auto-generation)
@@ -578,4 +578,3 @@ jobs:
         aws dynamodb delete-table --table-name ${{ needs.setup-state-backend.outputs.dynamodb-table }}
         
         echo "🗑️ State backend resources cleaned up"
-
