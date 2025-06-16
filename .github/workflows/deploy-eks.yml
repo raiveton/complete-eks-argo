@@ -23,6 +23,7 @@ on:
         - plan
         - apply
         - destroy
+        - force-destroy
       confirm_apply:
         description: 'Type "yes" to confirm apply/destroy action'
         required: false
@@ -32,10 +33,18 @@ on:
         description: 'Override cluster name (optional)'
         required: false
         type: string
+      cleanup_backend:
+        description: 'Cleanup state backend after destroy'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
 
 env:
   AWS_REGION: us-east-1
-  CLUSTER_NAME: raiveton-test
+  CLUSTER_NAME: my-eks-cluster
   TF_VERSION: 1.6.6
   TOFU_VERSION: 1.6.0
   # Optional: override bucket name (leave empty for auto-generation)
@@ -113,7 +122,7 @@ jobs:
           OWNER_NAME=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           
           # Create stable bucket name
-          BUCKET_NAME="tofu-state2-${OWNER_NAME}-${REPO_NAME}"
+          BUCKET_NAME="tofu-state-${OWNER_NAME}-${REPO_NAME}"
           echo "Generated bucket name: ${BUCKET_NAME}"
         fi
         
@@ -444,20 +453,70 @@ jobs:
       working-directory: ./terraform
       run: tofu init
 
+    - name: Show Terraform State Before Apply
+      working-directory: ./terraform
+      run: |
+        echo "📊 Current Terraform State:"
+        tofu state list || echo "No state found (fresh deployment)"
+        echo ""
+
     - name: Terraform Apply
       working-directory: ./terraform
       run: |
+        # Set environment variables for better output
+        export TF_IN_AUTOMATION=1
+        export TF_CLI_ARGS_apply="-parallelism=10"
+        
         # Try to use saved plan first, fallback to new plan if needed
         if [ -f "tfplan" ]; then
           echo "📦 Using saved plan from previous step"
-          tofu apply tfplan
+          echo "🚀 Starting apply process..."
+          echo "⏱️  This may take 15-20 minutes for EKS cluster creation..."
+          echo ""
+          
+          # Apply with progress indicators
+          tofu apply -no-color tfplan | while IFS= read -r line; do
+            echo "$line"
+            # Add timestamps to resource creation
+            if [[ $line == *"Creating..."* ]] || [[ $line == *"Creation complete"* ]] || [[ $line == *"Still creating"* ]]; then
+              echo "  └─ [$(date '+%H:%M:%S')] $line" >&2
+            fi
+          done
+          
+          echo ""
+          echo "✅ Apply completed successfully!"
         else
           echo "📝 Creating fresh plan (saved plan not found)"
+          echo "🚀 Starting fresh apply process..."
+          echo "⏱️  This may take 15-20 minutes for EKS cluster creation..."
+          echo ""
+          
+          # Apply with progress indicators
           tofu apply \
             -var="cluster_name=${{ steps.set-cluster-name.outputs.cluster-name }}" \
             -var="region=${{ env.AWS_REGION }}" \
-            -auto-approve
+            -auto-approve \
+            -no-color | while IFS= read -r line; do
+            echo "$line"
+            # Add timestamps to resource creation
+            if [[ $line == *"Creating..."* ]] || [[ $line == *"Creation complete"* ]] || [[ $line == *"Still creating"* ]]; then
+              echo "  └─ [$(date '+%H:%M:%S')] $line" >&2
+            fi
+          done
+          
+          echo ""
+          echo "✅ Fresh apply completed successfully!"
         fi
+
+    - name: Show Created Resources
+      working-directory: ./terraform
+      if: always()
+      run: |
+        echo "📋 Resources in Terraform State:"
+        tofu state list | sort
+        echo ""
+        echo "🔍 Key Resource Details:"
+        tofu state show aws_eks_cluster.eks_cluster | grep -E "(id|arn|endpoint|status)" || echo "EKS cluster not found in state"
 
     - name: Get cluster info
       id: cluster-info
@@ -494,6 +553,71 @@ jobs:
         echo '```bash' >> $GITHUB_STEP_SUMMARY
         echo "aws eks --region ${{ env.AWS_REGION }} update-kubeconfig --name ${{ steps.cluster-info.outputs.cluster-name }}" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
+
+  force-destroy:
+    name: Force Destroy (AWS Direct)
+    runs-on: ubuntu-latest
+    needs: [workflow-info, setup-state-backend]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'force-destroy'
+    environment: 
+      name: production-destroy
+      url: "Force destroying EKS cluster via AWS CLI"
+    
+    steps:
+    - name: Validate destroy confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirm_apply }}" != "yes" ]; then
+          echo "❌ Force destroy requires confirmation. Please set 'confirm_apply' to 'yes'"
+          echo "⚠️  This will force delete EKS cluster and resources via AWS CLI!"
+          exit 1
+        fi
+        echo "✅ Force destroy confirmation validated"
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Force delete EKS resources
+      run: |
+        CLUSTER_NAME="${{ env.CLUSTER_NAME }}"
+        
+        echo "🔍 Checking for existing EKS cluster..."
+        if aws eks describe-cluster --name $CLUSTER_NAME --region ${{ env.AWS_REGION }} 2>/dev/null; then
+          echo "📋 Found cluster $CLUSTER_NAME, proceeding with force deletion..."
+          
+          # Delete node groups first
+          echo "🗑️ Deleting node groups..."
+          NODE_GROUPS=$(aws eks list-nodegroups --cluster-name $CLUSTER_NAME --region ${{ env.AWS_REGION }} --query 'nodegroups[]' --output text)
+          for ng in $NODE_GROUPS; do
+            echo "Deleting node group: $ng"
+            aws eks delete-nodegroup --cluster-name $CLUSTER_NAME --nodegroup-name $ng --region ${{ env.AWS_REGION }}
+          done
+          
+          # Wait for node groups to delete
+          echo "⏳ Waiting for node groups to delete..."
+          for ng in $NODE_GROUPS; do
+            aws eks wait nodegroup-deleted --cluster-name $CLUSTER_NAME --nodegroup-name $ng --region ${{ env.AWS_REGION }}
+          done
+          
+          # Delete cluster
+          echo "🗑️ Deleting EKS cluster..."
+          aws eks delete-cluster --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+          aws eks wait cluster-deleted --name $CLUSTER_NAME --region ${{ env.AWS_REGION }}
+          
+          echo "✅ EKS cluster deleted successfully"
+        else
+          echo "ℹ️ No EKS cluster found with name $CLUSTER_NAME"
+        fi
+
+    - name: Clean state backend
+      if: github.event.inputs.cleanup_backend == 'true'
+      run: |
+        echo "🗑️ Cleaning state backend..."
+        aws s3 rm s3://${{ needs.setup-state-backend.outputs.bucket-name }}/eks-cluster/ --recursive
+        echo "✅ State cleaned"
 
   destroy:
     name: Terraform Destroy
