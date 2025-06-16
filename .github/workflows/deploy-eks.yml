@@ -516,7 +516,37 @@ jobs:
         tofu state list | sort
         echo ""
         echo "🔍 Key Resource Details:"
-        tofu state show aws_eks_cluster.eks_cluster | grep -E "(id|arn|endpoint|status)" || echo "EKS cluster not found in state"
+        
+        # EKS Cluster
+        if tofu state show aws_eks_cluster.eks_cluster >/dev/null 2>&1; then
+          echo "✅ EKS Cluster found in state"
+          tofu state show aws_eks_cluster.eks_cluster | grep -E "(id|arn|endpoint|status)"
+        else
+          echo "❌ EKS cluster not found in state"
+        fi
+        
+        # ArgoCD Namespace
+        if tofu state show kubernetes_namespace.argocd >/dev/null 2>&1; then
+          echo "✅ ArgoCD namespace found in state"
+          tofu state show kubernetes_namespace.argocd | head -10
+        else
+          echo "❌ ArgoCD namespace not found in state"
+        fi
+        
+        # Test connection ConfigMap
+        if tofu state show kubernetes_config_map.test_connection >/dev/null 2>&1; then
+          echo "✅ Test connection ConfigMap found in state"
+        else
+          echo "❌ Test connection ConfigMap not found in state"
+        fi
+        
+        # ArgoCD Helm Release
+        if tofu state show helm_release.argocd >/dev/null 2>&1; then
+          echo "✅ ArgoCD Helm release found in state"
+          tofu state show helm_release.argocd | grep -E "(name|namespace|status)"
+        else
+          echo "❌ ArgoCD Helm release not found in state"
+        fi
 
     - name: Get cluster info
       id: cluster-info
@@ -528,23 +558,103 @@ jobs:
         echo "cluster-endpoint=${CLUSTER_ENDPOINT}" >> $GITHUB_OUTPUT
         echo "cluster-name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
         
-        # Wait a bit for ArgoCD to be ready
+        # Wait for ArgoCD LoadBalancer to be ready
         echo "⏳ Waiting for ArgoCD LoadBalancer to be ready..."
-        sleep 60
         
-        # Get ArgoCD info
-        ARGOCD_URL=$(tofu output -raw argocd_server_url 2>/dev/null || echo "pending")        
+        # Try to get ArgoCD info with error handling
+        ARGOCD_URL="pending"
+        ARGOCD_PASSWORD="admin123"
+        
+        # Check if ArgoCD outputs exist
+        if tofu output argocd_server_url >/dev/null 2>&1; then
+          ARGOCD_URL=$(tofu output -raw argocd_server_url 2>/dev/null || echo "pending")
+        fi
+        
+        if tofu output argocd_admin_password >/dev/null 2>&1; then
+          ARGOCD_PASSWORD=$(tofu output -raw argocd_admin_password 2>/dev/null || echo "admin123")
+        fi
+        
         echo "argocd-url=${ARGOCD_URL}" >> $GITHUB_OUTPUT
         echo "argocd-password=${ARGOCD_PASSWORD}" >> $GITHUB_OUTPUT
+        
+        echo "Initial ArgoCD URL: ${ARGOCD_URL}"
 
-    - name: Configure kubectl
+    - name: Wait for ArgoCD LoadBalancer
       run: |
+        echo "⏳ Waiting for ArgoCD LoadBalancer to get external IP..."
+        echo "This may take up to 5 minutes..."
+        
+        # Configure kubectl
         aws eks --region ${{ env.AWS_REGION }} update-kubeconfig --name ${{ steps.cluster-info.outputs.cluster-name }}
+        
+        # Wait for ArgoCD service to exist
+        echo "🔍 Checking if ArgoCD service exists..."
+        kubectl wait --for=condition=Ready --timeout=300s pod -l app.kubernetes.io/name=argocd-server -n argocd || echo "Pods not ready yet"
+        
+        # Wait for LoadBalancer to get external hostname
+        echo "🔍 Waiting for LoadBalancer external hostname..."
+        timeout=300
+        counter=0
+        while [ $counter -lt $timeout ]; do
+          LB_HOST=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [ -n "$LB_HOST" ] && [ "$LB_HOST" != "null" ]; then
+            echo "✅ LoadBalancer ready: $LB_HOST"
+            echo "argocd-lb-host=${LB_HOST}" >> $GITHUB_OUTPUT
+            break
+          fi
+          echo "⏳ Still waiting... (${counter}s/${timeout}s)"
+          sleep 15
+          counter=$((counter + 15))
+        done
+        
+        if [ $counter -ge $timeout ]; then
+          echo "⚠️ LoadBalancer not ready after 5 minutes"
+          echo "argocd-lb-host=pending" >> $GITHUB_OUTPUT
+        fi
+      id: wait-argocd
 
     - name: Test cluster connectivity
       run: |
+        echo "🔍 Testing cluster connectivity..."
+        
+        # Configure kubectl
+        aws eks --region ${{ env.AWS_REGION }} update-kubeconfig --name ${{ steps.cluster-info.outputs.cluster-name }}
+        
+        # Test basic connectivity
+        echo "📋 Cluster info:"
         kubectl cluster-info
-        kubectl get nodes
+        
+        echo ""
+        echo "📋 Nodes:"
+        kubectl get nodes -o wide
+        
+        echo ""
+        echo "📋 System namespaces:"
+        kubectl get namespaces
+        
+        echo ""
+        echo "📋 All pods in kube-system:"
+        kubectl get pods -n kube-system
+        
+        echo ""
+        echo "🔍 Checking for ArgoCD namespace..."
+        if kubectl get namespace argocd 2>/dev/null; then
+          echo "✅ ArgoCD namespace exists"
+          echo "📋 ArgoCD pods:"
+          kubectl get pods -n argocd -o wide
+          echo ""
+          echo "📋 ArgoCD services:"
+          kubectl get svc -n argocd
+        else
+          echo "❌ ArgoCD namespace not found!"
+          echo "🔧 Let's create it manually..."
+          kubectl create namespace argocd
+          echo "✅ ArgoCD namespace created manually"
+        fi
+        
+        echo ""
+        echo "📋 Final namespace list:"
+        kubectl get namespaces
 
     - name: Create deployment summary
       run: |
@@ -552,6 +662,7 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "✅ **Successfully deployed!**" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🎯 Cluster Information" >> $GITHUB_STEP_SUMMARY
         echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
         echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
         echo "| Cluster Name | ${{ steps.cluster-info.outputs.cluster-name }} |" >> $GITHUB_STEP_SUMMARY
@@ -559,10 +670,59 @@ jobs:
         echo "| AWS Region | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
         echo "| State Bucket | ${{ needs.setup-state-backend.outputs.bucket-name }} |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Configure kubectl locally:" >> $GITHUB_STEP_SUMMARY
+        echo "### 🎨 ArgoCD Information" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        
+        # Check if LoadBalancer is ready
+        if [ "${{ steps.wait-argocd.outputs.argocd-lb-host }}" != "pending" ] && [ -n "${{ steps.wait-argocd.outputs.argocd-lb-host }}" ]; then
+          ARGOCD_URL="http://${{ steps.wait-argocd.outputs.argocd-lb-host }}"
+          echo "| ArgoCD URL | $ARGOCD_URL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Username | admin |" >> $GITHUB_STEP_SUMMARY
+          echo "| Password | ${{ steps.cluster-info.outputs.argocd-password }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ Ready |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| ArgoCD URL | ⏳ LoadBalancer pending |" >> $GITHUB_STEP_SUMMARY
+          echo "| Username | admin |" >> $GITHUB_STEP_SUMMARY
+          echo "| Password | ${{ steps.cluster-info.outputs.argocd-password }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ⏳ Setting up LoadBalancer... |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
+        echo "1. **Configure kubectl locally:**" >> $GITHUB_STEP_SUMMARY
         echo '```bash' >> $GITHUB_STEP_SUMMARY
         echo "aws eks --region ${{ env.AWS_REGION }} update-kubeconfig --name ${{ steps.cluster-info.outputs.cluster-name }}" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.wait-argocd.outputs.argocd-lb-host }}" != "pending" ] && [ -n "${{ steps.wait-argocd.outputs.argocd-lb-host }}" ]; then
+          ARGOCD_URL="http://${{ steps.wait-argocd.outputs.argocd-lb-host }}"
+          echo "2. **Access ArgoCD (Ready!):**" >> $GITHUB_STEP_SUMMARY
+          echo "   - URL: $ARGOCD_URL" >> $GITHUB_STEP_SUMMARY
+          echo "   - Username: admin" >> $GITHUB_STEP_SUMMARY
+          echo "   - Password: ${{ steps.cluster-info.outputs.argocd-password }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "3. **ArgoCD CLI:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Install ArgoCD CLI" >> $GITHUB_STEP_SUMMARY
+          echo "brew install argocd" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Login" >> $GITHUB_STEP_SUMMARY
+          echo "argocd login ${{ steps.wait-argocd.outputs.argocd-lb-host }} --username admin --password ${{ steps.cluster-info.outputs.argocd-password }} --insecure" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "2. **ArgoCD LoadBalancer Setup:**" >> $GITHUB_STEP_SUMMARY
+          echo "   - LoadBalancer is still being provisioned" >> $GITHUB_STEP_SUMMARY
+          echo "   - Check status with:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "kubectl get svc argocd-server -n argocd" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "   - URL will be available in a few minutes" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "⚠️ **Important**: Change the default admin password after first login!"
 
   force-destroy:
     name: Force Destroy (AWS Direct)

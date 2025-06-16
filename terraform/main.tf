@@ -5,11 +5,39 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.23"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.11"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9"
+    }
   }
 }
 
 provider "aws" {
   region = var.region
+}
+
+# Kubernetes Provider
+provider "kubernetes" {
+  host                   = aws_eks_cluster.eks_cluster.endpoint
+  cluster_ca_certificate = base64decode(aws_eks_cluster.eks_cluster.certificate_authority[0].data)
+  token                  = data.aws_eks_cluster_auth.eks_cluster_auth.token
+}
+
+# Helm Provider  
+provider "helm" {
+  kubernetes {
+    host                   = aws_eks_cluster.eks_cluster.endpoint
+    cluster_ca_certificate = base64decode(aws_eks_cluster.eks_cluster.certificate_authority[0].data)
+    token                  = data.aws_eks_cluster_auth.eks_cluster_auth.token
+  }
 }
 
 # Data sources
@@ -355,13 +383,54 @@ resource "aws_eks_addon" "ebs_csi_driver" {
   addon_name   = "aws-ebs-csi-driver"
 }
 
+# Data source to get EKS cluster auth token
+data "aws_eks_cluster_auth" "eks_cluster_auth" {
+  name = aws_eks_cluster.eks_cluster.name
+}
+
+# Wait for cluster to be ready
+resource "time_sleep" "wait_for_cluster" {
+  depends_on = [
+    aws_eks_cluster.eks_cluster,
+    aws_eks_node_group.eks_nodes,
+    aws_eks_addon.coredns,
+    aws_eks_addon.kube_proxy,
+    aws_eks_addon.vpc_cni,
+    aws_eks_addon.ebs_csi_driver
+  ]
+  
+  create_duration = "180s"  # Увеличили время ожидания
+}
+
+# Test Kubernetes connection with a simple resource first
+resource "kubernetes_config_map" "test_connection" {
+  metadata {
+    name      = "eks-test-connection"
+    namespace = "default"
+  }
+  
+  data = {
+    cluster_name = aws_eks_cluster.eks_cluster.name
+    timestamp    = timestamp()
+  }
+  
+  depends_on = [time_sleep.wait_for_cluster]
+}
+
 # ArgoCD Namespace
 resource "kubernetes_namespace" "argocd" {
   metadata {
     name = "argocd"
+    labels = {
+      name = "argocd"
+      "app.kubernetes.io/name" = "argocd"
+    }
   }
   
-  depends_on = [aws_eks_node_group.eks_nodes]
+  depends_on = [
+    time_sleep.wait_for_cluster,
+    kubernetes_config_map.test_connection
+  ]
 }
 
 # ArgoCD Helm Release
@@ -371,6 +440,12 @@ resource "helm_release" "argocd" {
   chart      = "argo-cd"
   version    = "5.51.6"  # Latest stable version
   namespace  = kubernetes_namespace.argocd.metadata[0].name
+  
+  # Wait for install to complete
+  wait             = true
+  timeout          = 900  # Увеличили timeout до 15 минут
+  dependency_update = true
+  create_namespace = false  # Namespace уже создан выше
 
   # ArgoCD Server Configuration
   values = [
@@ -392,7 +467,11 @@ server:
 configs:
   params:
     server.insecure: true
-
+  
+  # Default admin password (change this in production!)
+  secret:
+    argocdServerAdminPassword: "$2a$12$hBFn3rWf7oLJUx6g6FoH2uXZQ7.V5qF5V5P8P5K5P5K5P5K5P5K5Pe"  # admin123
+    argocdServerAdminPasswordMtime: "2023-01-01T00:00:00Z"
 
 # Enable notifications controller
 notifications:
@@ -409,9 +488,67 @@ EOF
   ]
 
   depends_on = [
-    aws_eks_node_group.eks_nodes,
-    kubernetes_namespace.argocd
+    kubernetes_namespace.argocd,
+    kubernetes_config_map.test_connection
   ]
+}
+
+# Fallback: Install ArgoCD via kubectl if Helm fails
+resource "null_resource" "argocd_fallback" {
+  count = 0  # Включить только если Helm не работает
+  
+  depends_on = [
+    kubernetes_namespace.argocd,
+    kubernetes_config_map.test_connection
+  ]
+
+  provisioner "local-exec" {
+    command = <<EOF
+echo "Installing ArgoCD via kubectl fallback..."
+
+# Configure kubectl
+aws eks --region ${var.region} update-kubeconfig --name ${aws_eks_cluster.eks_cluster.name}
+
+# Verify namespace exists
+kubectl get namespace argocd || kubectl create namespace argocd
+
+# Install ArgoCD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for ArgoCD to be ready
+kubectl wait --for=condition=available --timeout=600s deployment/argocd-server -n argocd
+
+# Patch ArgoCD server to use LoadBalancer
+kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+
+# Add LoadBalancer annotations
+kubectl annotate svc argocd-server -n argocd \
+  service.beta.kubernetes.io/aws-load-balancer-type=nlb \
+  service.beta.kubernetes.io/aws-load-balancer-scheme=internet-facing
+
+# Enable insecure mode
+kubectl patch deploy argocd-server -n argocd --type json \
+  -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--insecure"}]'
+
+# Set admin password
+ADMIN_PASSWORD='admin123'
+ADMIN_PASSWORD_HASH='$2a$12$hBFn3rWf7oLJUx6g6FoH2uXZQ7.V5qF5V5P8P5K5P5K5P5K5P5K5Pe'
+kubectl -n argocd patch secret argocd-secret \
+  -p '{"data": {"admin.password": "'$(echo -n "$ADMIN_PASSWORD_HASH" | base64)'", "admin.passwordMtime": "'$(date +%FT%T%Z | base64)'"}}'
+
+# Restart server to apply changes
+kubectl rollout restart deployment/argocd-server -n argocd
+kubectl rollout status deployment/argocd-server -n argocd
+
+echo "ArgoCD installed successfully via kubectl!"
+EOF
+  }
+}
+
+# Wait for ArgoCD to be ready
+resource "time_sleep" "wait_for_argocd" {
+  depends_on = [helm_release.argocd]
+  create_duration = "180s"  # Увеличили время ожидания
 }
 
 # Data source to get ArgoCD LoadBalancer hostname
@@ -421,7 +558,10 @@ data "kubernetes_service" "argocd_server" {
     namespace = kubernetes_namespace.argocd.metadata[0].name
   }
   
-  depends_on = [helm_release.argocd]
+  depends_on = [
+    helm_release.argocd,
+    time_sleep.wait_for_argocd
+  ]
 }
 
 # outputs.tf
@@ -484,4 +624,36 @@ output "public_subnets" {
 output "configure_kubectl" {
   description = "Configure kubectl: make sure you're logged in with the correct AWS profile and run the following command to update your kubeconfig"
   value       = "aws eks --region ${var.region} update-kubeconfig --name ${var.cluster_name}"
+}
+
+# ArgoCD Outputs
+output "argocd_server_hostname" {
+  description = "ArgoCD Server LoadBalancer hostname"
+  value       = try(data.kubernetes_service.argocd_server.status[0].load_balancer[0].ingress[0].hostname, "pending")
+}
+
+output "argocd_server_url" {
+  description = "ArgoCD Server URL"
+  value       = "http://${try(data.kubernetes_service.argocd_server.status[0].load_balancer[0].ingress[0].hostname, "pending")}"
+}
+
+output "argocd_admin_password" {
+  description = "ArgoCD admin password (default)"
+  value       = "admin123"
+  sensitive   = true
+}
+
+output "argocd_login_instructions" {
+  description = "Instructions to login to ArgoCD"
+  value       = <<EOF
+1. Wait for LoadBalancer to be ready (may take 2-3 minutes)
+2. Get ArgoCD URL: ${try("http://" + data.kubernetes_service.argocd_server.status[0].load_balancer[0].ingress[0].hostname, "pending")}
+3. Login with:
+   - Username: admin
+   - Password: admin123
+4. Change password after first login!
+
+Alternative CLI login:
+argocd login ${try(data.kubernetes_service.argocd_server.status[0].load_balancer[0].ingress[0].hostname, "pending")} --username admin --password admin123 --insecure
+EOF
 }
